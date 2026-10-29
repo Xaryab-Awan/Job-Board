@@ -32,7 +32,7 @@ function fillDetails(box, full) {
 }
 
 // ---------- APPLY: the form ----------
-function buildApplyForm(box, ad) {
+function buildApplyForm(box, ad, onApplied) {
   // 1. Who is applying: the details come from the user's profile.
   const who = el("div", "card card-body py-2 px-3 mb-3");
   who.append(el("div", "fw-bold", currentUser.name));
@@ -83,19 +83,13 @@ function buildApplyForm(box, ad) {
       }
       const data = await res.json();
 
-      if (!res.ok) {
-        showAlert(alertBox, data.error, "danger");
-        send.disabled = false;
+      // 409 = the user already applied to this job (for example in another tab)
+      if (res.ok || res.status === 409) {
+        onApplied(ad, res.ok);
         return;
       }
-      const done = el("div", "");
-      showAlert(
-        done,
-        "Application sent. Your message and profile details were saved with this ad.",
-        "success",
-      );
-      done.classList.remove("mt-3");
-      box.replaceChildren(done);
+      showAlert(alertBox, data.error, "danger");
+      send.disabled = false;
     } catch (err) {
       console.error(err);
       showAlert(alertBox, "Could not reach the server. Try again.", "danger");
@@ -107,7 +101,7 @@ function buildApplyForm(box, ad) {
 }
 
 // ---------- One job in the list ----------
-function renderAd(ad) {
+function renderAd(ad, onApplied) {
   const item = el("article", "list-group-item p-3 p-md-4");
 
   // Left side: the text
@@ -185,12 +179,34 @@ function renderAd(ad) {
       apply.setAttribute("aria-expanded", "false");
       return;
     }
-    if (form.childElementCount === 0) buildApplyForm(form, ad);
+    if (form.childElementCount === 0) buildApplyForm(form, ad, onApplied);
     form.hidden = false;
     apply.setAttribute("aria-expanded", "true");
   });
 
   return item;
+}
+
+// ---------- After applying: the job leaves the board ----------
+// The row becomes a short confirmation (it is gone at the next page load,
+// because the server no longer lists jobs the user applied to).
+function markApplied(ad, justSent) {
+  const index = entries.findIndex((e) => e.ad.id === ad.id);
+  if (index === -1) return;
+  const { item } = entries[index];
+  entries.splice(index, 1);
+
+  const box = el("div", "alert alert-success mb-0");
+  box.append(
+    justSent
+      ? `Application sent for ${ad.title}. `
+      : `You already applied to ${ad.title}. `,
+  );
+  const link = el("a", "alert-link", "Follow its status in My applications.");
+  link.href = "/applications.html";
+  box.append(link);
+  item.replaceChildren(box);
+  applySearch();
 }
 
 // ---------- Search: hide the jobs that don't match ----------
@@ -249,14 +265,14 @@ async function init() {
       el(
         "div",
         "list-group-item p-4 text-body-secondary",
-        "No positions are open yet. Check back soon.",
+        "No open positions right now. The jobs you applied to are in My applications.",
       ),
     );
     return;
   }
 
   ads.forEach((ad) => {
-    const item = renderAd(ad);
+    const item = renderAd(ad, markApplied);
     entries.push({ ad, item });
     list.append(item);
   });

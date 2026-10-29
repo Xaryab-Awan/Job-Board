@@ -19,6 +19,20 @@ function showAlert(box, message, kind) {
   box.hidden = !message;
 }
 
+// "2026-10-27T13:22:39.000Z" becomes "27 Oct 2026, 13:22" (in the user's time zone).
+function formatDate(value) {
+  if (!value) return "";
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return String(value);
+  return d.toLocaleString("en-GB", {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 // Asks the server who is logged in. If nobody is, go to the login page.
 async function loadUser() {
   const res = await fetch("/api/me");
@@ -30,7 +44,8 @@ async function loadUser() {
   return currentUser;
 }
 
-// Draws the links of the navbar. `active` is "jobs", "profile" or "admin".
+// Draws the links of the navbar.
+// `active` is "jobs", "applications", "profile" or "admin".
 function renderNav(active) {
   const nav = document.getElementById("nav-links");
   nav.replaceChildren();
@@ -48,6 +63,7 @@ function renderNav(active) {
   };
 
   addLink("Jobs", "/", "jobs");
+  addLink("My applications", "/applications.html", "applications");
   addLink("My profile", "/profile.html", "profile");
   if (currentUser.role === "admin") addLink("Admin", "/admin.html", "admin");
 

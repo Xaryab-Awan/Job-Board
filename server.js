@@ -37,20 +37,33 @@ function requireAdminPage(req, res, next) {
 // ---------- PAGE GUARDS ----------
 // These MUST come before express.static. Static files are served by the
 // first middleware that matches, so a guard placed after it never runs.
-app.get(["/", "/index.html", "/profile.html"], requireLoginPage);
+app.get(
+  ["/", "/index.html", "/profile.html", "/applications.html"],
+  requireLoginPage,
+);
 app.get("/admin.html", requireAdminPage);
+
+// The HTML pages live in public/html, the styles and scripts in their own
+// folders. public/ itself is NOT served, so /html/admin.html cannot be used
+// to skip the guards above.
 app.use("/css", express.static("public/css"));
 app.use("/js", express.static("public/js"));
 app.use(express.static("public/html"));
 
 // ---------- ADS ----------
+// The list only contains the jobs the user has NOT applied to yet.
 app.get("/api/ads", requireLogin, async (req, res) => {
   try {
     const [rows] = await db.query(
       `SELECT ads.id, ads.title, ads.short_description, ads.location,
               ads.wage, ads.working_time, companies.name AS company_name
        FROM ads JOIN companies ON ads.company_id = companies.id
+       WHERE NOT EXISTS (
+         SELECT 1 FROM applications
+         WHERE applications.ad_id = ads.id AND applications.user_id = ?
+       )
        ORDER BY ads.created_at DESC, ads.id DESC`,
+      [req.session.user.id],
     );
     res.json(rows);
   } catch (err) {
@@ -77,7 +90,7 @@ app.get("/api/ads/:id", requireLogin, async (req, res) => {
 });
 
 // APPLY: the applicant is always the logged-in user (their profile details
-// are linked to the application through user_id).
+// are linked to the application through user_id). One application per job.
 app.post("/api/ads/:id/applications", requireLogin, async (req, res) => {
   try {
     const message = (req.body.message || "").trim();
@@ -89,12 +102,24 @@ app.post("/api/ads/:id/applications", requireLogin, async (req, res) => {
     if (ads.length === 0)
       return res.status(404).json({ error: "Ad not found" });
 
+    const [already] = await db.query(
+      "SELECT id FROM applications WHERE ad_id = ? AND user_id = ?",
+      [req.params.id, req.session.user.id],
+    );
+    if (already.length > 0) {
+      return res.status(409).json({ error: "You already applied to this job." });
+    }
+
     await db.query(
       "INSERT INTO applications (ad_id, user_id, message) VALUES (?, ?, ?)",
       [req.params.id, req.session.user.id, message],
     );
     res.status(201).json({ ok: true });
   } catch (err) {
+    // Two clicks at the same time: the UNIQUE key in the database catches it.
+    if (err.code === "ER_DUP_ENTRY") {
+      return res.status(409).json({ error: "You already applied to this job." });
+    }
     console.error(err);
     res.status(500).json({ error: "Server error" });
   }
@@ -218,7 +243,34 @@ app.put("/api/me", requireLogin, async (req, res) => {
   }
 });
 
+// MY APPLICATIONS: the status of everything the user applied to.
+// COALESCE: if the job was removed (someone was accepted), we use the title
+// and company that were saved on the application at that moment.
+app.get("/api/me/applications", requireLogin, async (req, res) => {
+  try {
+    const [rows] = await db.query(
+      `SELECT applications.id, applications.message, applications.status,
+              applications.created_at,
+              COALESCE(ads.title, applications.ad_title) AS ad_title,
+              COALESCE(companies.name, applications.company_name) AS company_name
+       FROM applications
+       LEFT JOIN ads ON applications.ad_id = ads.id
+       LEFT JOIN companies ON ads.company_id = companies.id
+       WHERE applications.user_id = ?
+       ORDER BY applications.created_at DESC, applications.id DESC`,
+      [req.session.user.id],
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 // ---------- ADMIN ----------
+// Which columns an admin may write in each table (a whitelist).
+// The status of an application is NOT in the list on purpose: it can only
+// change through the accept / reject route below.
 const adminTables = {
   users: ["name", "email", "phone", "role"],
   companies: ["name", "website", "location"],
@@ -235,6 +287,40 @@ const adminTables = {
   applications: ["ad_id", "user_id", "message"],
 };
 
+// What the admin tables show: names instead of ids (joins), one query per table.
+const adminQueries = {
+  users: `SELECT id, name, email, phone, role, created_at
+          FROM users ORDER BY id DESC LIMIT ? OFFSET ?`,
+  companies: `SELECT id, name, website, location
+              FROM companies ORDER BY id DESC LIMIT ? OFFSET ?`,
+  ads: `SELECT ads.*, companies.name AS company_name, users.name AS owner_name
+        FROM ads
+        LEFT JOIN companies ON ads.company_id = companies.id
+        LEFT JOIN users ON ads.owner_id = users.id
+        ORDER BY ads.id DESC LIMIT ? OFFSET ?`,
+  applications: `SELECT applications.id, applications.ad_id, applications.user_id,
+                        applications.message, applications.status,
+                        applications.created_at,
+                        COALESCE(ads.title, applications.ad_title) AS ad_title,
+                        COALESCE(companies.name, applications.company_name) AS company_name,
+                        users.name AS applicant_name
+                 FROM applications
+                 LEFT JOIN ads ON applications.ad_id = ads.id
+                 LEFT JOIN companies ON ads.company_id = companies.id
+                 LEFT JOIN users ON applications.user_id = users.id
+                 ORDER BY applications.id DESC LIMIT ? OFFSET ?`,
+};
+
+// Lists used by the dropdowns of the admin form (id + readable label).
+const adminLookups = {
+  users: `SELECT id, CONCAT(name, ' (', email, ')') AS label
+          FROM users ORDER BY name LIMIT 500`,
+  companies: `SELECT id, name AS label FROM companies ORDER BY name LIMIT 500`,
+  ads: `SELECT ads.id, CONCAT(ads.title, ' - ', companies.name) AS label
+        FROM ads JOIN companies ON ads.company_id = companies.id
+        ORDER BY ads.title LIMIT 500`,
+};
+
 function requireAdmin(req, res, next) {
   if (!req.session.user)
     return res.status(401).json({ error: "Not logged in" });
@@ -243,7 +329,7 @@ function requireAdmin(req, res, next) {
   next();
 }
 function checkTable(req, res, next) {
-  if (!adminTables[req.params.table])
+  if (!Object.hasOwn(adminTables, req.params.table))
     return res.status(404).json({ error: "Unknown table" });
   next();
 }
@@ -257,6 +343,38 @@ function pickFields(table, body) {
   return data;
 }
 
+// Turns a MySQL error into a sentence an admin can understand.
+function friendlyDbError(err) {
+  switch (err.code) {
+    case "ER_DUP_ENTRY":
+      return "A record with the same value already exists (same email, or the user already applied to this job).";
+    case "ER_NO_REFERENCED_ROW_2":
+      return "The selected company, job or user does not exist.";
+    case "ER_ROW_IS_REFERENCED_2":
+      return "This record is still used by other records. Delete those first.";
+    case "ER_BAD_NULL_ERROR":
+    case "ER_NO_DEFAULT_FOR_FIELD":
+      return "Please fill in all the required fields.";
+    case "ER_DATA_TOO_LONG":
+      return "One of the values is too long.";
+    default:
+      return err.sqlMessage || "Invalid data";
+  }
+}
+
+// LOOKUP (dropdown lists)
+app.get("/api/admin/lookup/:name", requireAdmin, async (req, res) => {
+  if (!Object.hasOwn(adminLookups, req.params.name))
+    return res.status(404).json({ error: "Unknown list" });
+  try {
+    const [rows] = await db.query(adminLookups[req.params.name]);
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 // LIST (paginated)
 app.get("/api/admin/:table", admin, async (req, res) => {
   try {
@@ -266,10 +384,10 @@ app.get("/api/admin/:table", admin, async (req, res) => {
     const [[{ total }]] = await db.query("SELECT COUNT(*) AS total FROM ??", [
       table,
     ]);
-    const [rows] = await db.query(
-      "SELECT * FROM ?? ORDER BY id DESC LIMIT ? OFFSET ?",
-      [table, limit, (page - 1) * limit],
-    );
+    const [rows] = await db.query(adminQueries[table], [
+      limit,
+      (page - 1) * limit,
+    ]);
     rows.forEach((r) => delete r.password_hash);
     res.json({ rows, total, page, pages: Math.ceil(total / limit) });
   } catch (err) {
@@ -290,8 +408,89 @@ app.post("/api/admin/:table", admin, async (req, res) => {
     res.status(201).json({ id: r.insertId });
   } catch (err) {
     console.error(err);
-    res.status(400).json({ error: err.sqlMessage || "Invalid data" });
+    res.status(400).json({ error: friendlyDbError(err) });
   }
+});
+
+// ACCEPT / REJECT an application.
+// Rejected: only the status changes.
+// Accepted: the job is filled, so in ONE transaction (all steps or none):
+//   1. this application becomes "accepted"
+//   2. the other pending applications for the same job become "rejected"
+//   3. the job title and company are copied onto the applications, so the
+//      users can still see what they applied to
+//   4. the applications are detached from the job (ad_id = NULL)
+//   5. the job is deleted from the database (and so from the board)
+app.patch("/api/admin/applications/:id", requireAdmin, async (req, res) => {
+  const status = req.body.status;
+  if (!["accepted", "rejected"].includes(status)) {
+    return res
+      .status(400)
+      .json({ error: "Status must be accepted or rejected" });
+  }
+
+  let conn;
+  let result;
+  try {
+    conn = await db.getConnection();
+    await conn.beginTransaction();
+
+    const [rows] = await conn.query(
+      "SELECT id, ad_id, status FROM applications WHERE id = ? FOR UPDATE",
+      [req.params.id],
+    );
+    const application = rows[0];
+
+    if (!application) {
+      result = [404, { error: "Application not found" }];
+    } else if (application.status !== "pending") {
+      result = [409, { error: "This application was already decided." }];
+    } else if (status === "accepted" && application.ad_id === null) {
+      result = [409, { error: "This job is no longer available." }];
+    } else if (status === "rejected") {
+      await conn.query(
+        "UPDATE applications SET status = 'rejected' WHERE id = ?",
+        [application.id],
+      );
+      result = [200, { ok: true }];
+    } else {
+      const adId = application.ad_id;
+      await conn.query(
+        "UPDATE applications SET status = 'accepted' WHERE id = ?",
+        [application.id],
+      );
+      await conn.query(
+        `UPDATE applications SET status = 'rejected'
+         WHERE ad_id = ? AND id <> ? AND status = 'pending'`,
+        [adId, application.id],
+      );
+      await conn.query(
+        `UPDATE applications
+         JOIN ads ON applications.ad_id = ads.id
+         JOIN companies ON ads.company_id = companies.id
+         SET applications.ad_title = ads.title,
+             applications.company_name = companies.name
+         WHERE applications.ad_id = ?`,
+        [adId],
+      );
+      await conn.query(
+        "UPDATE applications SET ad_id = NULL WHERE ad_id = ?",
+        [adId],
+      );
+      await conn.query("DELETE FROM ads WHERE id = ?", [adId]);
+      result = [200, { ok: true }];
+    }
+
+    if (result[0] === 200) await conn.commit();
+    else await conn.rollback();
+  } catch (err) {
+    console.error(err);
+    if (conn) await conn.rollback().catch(() => {});
+    result = [500, { error: "Server error" }];
+  } finally {
+    if (conn) conn.release();
+  }
+  res.status(result[0]).json(result[1]);
 });
 
 // UPDATE
@@ -312,7 +511,7 @@ app.put("/api/admin/:table/:id", admin, async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     console.error(err);
-    res.status(400).json({ error: err.sqlMessage || "Invalid data" });
+    res.status(400).json({ error: friendlyDbError(err) });
   }
 });
 
@@ -328,9 +527,7 @@ app.delete("/api/admin/:table/:id", admin, async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     console.error(err);
-    res
-      .status(400)
-      .json({ error: err.sqlMessage || "Cannot delete this record" });
+    res.status(400).json({ error: friendlyDbError(err) });
   }
 });
 
